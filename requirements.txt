@@ -1,4 +1,13 @@
+# Raspberry Pi: install deps then the editable package (imports imugesture from src/).
+#   pip install -r requirements.txt
+#   pip install -e .
+#
+# Library code: src/imugesture/   CLI: scripts/
+# PC/Mac UDP:   pc/               + pc/requirements.txt
+#
 numpy
 scikit-learn
 joblib
+adafruit-blinka
 adafruit-circuitpython-mpu6050
+adafruit-circuitpython-ads1x15

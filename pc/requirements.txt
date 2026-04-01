@@ -1,0 +1,7 @@
+# Install on the gaming PC / Mac only (for scripts in this folder).
+# From the repo root:
+#   pip install -r pc/requirements.txt
+# Before pip install, upgrade pip (macOS/old pip may pick yanked pyobjc 12.0 sdists
+# and fail without building C extensions):
+#   python -m pip install --upgrade pip setuptools wheel
+pynput
