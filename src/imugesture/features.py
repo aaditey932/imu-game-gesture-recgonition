@@ -13,7 +13,6 @@ Must match flex_reader.N_FLEX_CHANNELS and WINDOW_SIZE in collect_data / train /
 
 from __future__ import annotations
 
-import math
 from typing import List
 
 import numpy as np
@@ -22,11 +21,6 @@ N_FLEX_CHANNELS = 2
 FEATURE_SCHEMA = "v2"
 
 _IMU_NAMES = ("ax", "ay", "az", "gx", "gy", "gz")
-
-
-def _magnitude_3d(x, y, z) -> float:
-    """Magnitude of (x, y, z)."""
-    return math.sqrt(x * x + y * y + z * z)
 
 
 def _six_stats(col: np.ndarray) -> List[float]:

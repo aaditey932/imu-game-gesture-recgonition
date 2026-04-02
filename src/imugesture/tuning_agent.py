@@ -132,17 +132,13 @@ def validate_and_apply_min_confidence(
     Clamp to [clamp_min, clamp_max], limit delta from current by max_delta.
     Returns (new_value, note).
     """
-    lo, hi = settings.clamp_min, settings.clamp_max
-    target = max(lo, min(hi, float(raw)))
-    delta = target - current
-    if abs(delta) > settings.max_delta:
-        step = settings.max_delta if delta > 0 else -settings.max_delta
-        target = current + step
-        target = max(lo, min(hi, target))
-        note = f"delta capped to ±{settings.max_delta}; applied {target:.4f}"
-    else:
-        note = f"applied {target:.4f}"
-    return target, note
+    return validate_energy_scalar(
+        raw,
+        current,
+        settings.clamp_min,
+        settings.clamp_max,
+        settings.max_delta,
+    )
 
 
 def validate_energy_scalar(
