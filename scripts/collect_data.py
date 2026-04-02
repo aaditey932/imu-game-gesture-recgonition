@@ -39,6 +39,9 @@ SAMPLE_DELAY_SEC = 0.04
 N_FLEX_CHANNELS = 2
 
 WINDOWS_PER_TAKE = 100
+# New take_id (and a fresh timestamp_iso) every N windows within one recording run.
+# Must divide WINDOWS_PER_TAKE evenly so each recording run uses an integer number of chunks.
+TAKE_ID_EVERY_N_WINDOWS = 20
 PAUSE_BETWEEN_WINDOWS_SEC = 1.0
 LEAD_IN_SEC = 0.3
 COUNTDOWN_SEC = 1.0
@@ -163,6 +166,21 @@ def migrate_csv_if_needed():
     if header == expected:
         return
 
+    n_exp = len(expected)
+    # Training/export CSVs may append derived feature columns after take_id; collection only stores raw window + meta.
+    if len(header) > n_exp and header[:n_exp] == expected:
+        migrated = [expected]
+        for row in rows[1:]:
+            if not row:
+                continue
+            migrated.append(_normalize_row_width(row[:n_exp], n_exp))
+        tmp_file = DATA_CSV.parent / (DATA_CSV.name + ".tmp")
+        with open(tmp_file, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerows(migrated)
+        os.replace(tmp_file, DATA_CSV)
+        return
+
     old_flex_count = _detect_flex_count_from_header(header)
     if old_flex_count <= 0:
         raise ValueError(
@@ -217,6 +235,26 @@ def flatten_window(window):
     for sample in window:
         row.extend(sample)
     return row
+
+
+def read_max_take_id(csv_path):
+    """Largest take_id in existing CSV (0 if missing/empty). Used so restarts do not reuse ids."""
+    if not os.path.exists(csv_path):
+        return 0
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or "take_id" not in reader.fieldnames:
+            return 0
+        m = 0
+        for row in reader:
+            v = (row.get("take_id") or "").strip()
+            if not v:
+                continue
+            try:
+                m = max(m, int(v))
+            except ValueError:
+                pass
+        return m
 
 
 def append_row(label, window, timestamp_iso, take_id):
@@ -289,7 +327,10 @@ def main():
         "5=punch_right 6=kick_right 7=duck_right"
     )
     print("Press key to record immediately.")
-    print(f"Window: {WINDOW_SIZE} samples, {SAMPLE_DELAY_SEC}s between; {WINDOWS_PER_TAKE} windows per take.")
+    print(
+        f"Window: {WINDOW_SIZE} samples, {SAMPLE_DELAY_SEC}s between; "
+        f"{WINDOWS_PER_TAKE} windows per run; take_id changes every {TAKE_ID_EVERY_N_WINDOWS} windows."
+    )
     print(f"Data saved to: {DATA_CSV}\n")
 
     try:
@@ -313,7 +354,17 @@ def main():
         print(f"Error setting up ADS1x15 (flex): {e}")
         return
 
-    take_id = 0
+    if WINDOWS_PER_TAKE % TAKE_ID_EVERY_N_WINDOWS != 0:
+        print(
+            "Error: WINDOWS_PER_TAKE must be a multiple of TAKE_ID_EVERY_N_WINDOWS "
+            "so each recording run emits equal-sized chunks."
+        )
+        return
+
+    take_id = read_max_take_id(str(DATA_CSV))
+    if take_id > 0:
+        print(f"Resuming take_id from CSV (next chunk will use ids starting at {take_id + 1}).")
+
     while True:
         print(
             "\nPress 1=Idle 2=punch_left 3=kick_left 4=duck_left "
@@ -326,18 +377,35 @@ def main():
             print("Use 1..7 (or q to quit).")
             continue
         label = KEY_TO_LABEL[choice]
-        take_id += 1
-        timestamp_iso = datetime.now(timezone.utc).isoformat()
 
         run_countdown_and_lead_in(label)
 
+        first_take_this_run = None
+        last_take_this_run = None
+        n_chunks = (WINDOWS_PER_TAKE + TAKE_ID_EVERY_N_WINDOWS - 1) // TAKE_ID_EVERY_N_WINDOWS
+
         for i in range(WINDOWS_PER_TAKE):
-            print(f"  Recording window {i + 1}/{WINDOWS_PER_TAKE}…")
+            if i % TAKE_ID_EVERY_N_WINDOWS == 0:
+                take_id += 1
+                last_take_this_run = take_id
+                if first_take_this_run is None:
+                    first_take_this_run = take_id
+                timestamp_iso = datetime.now(timezone.utc).isoformat()
+
+            chunk = i // TAKE_ID_EVERY_N_WINDOWS + 1
+            print(
+                f"  Recording window {i + 1}/{WINDOWS_PER_TAKE} "
+                f"(take_id={take_id}, chunk {chunk}/{n_chunks})…"
+            )
             window = record_one_window(read_accel, read_gyro, read_flex)
             append_row(label, window, timestamp_iso, take_id)
             if i < WINDOWS_PER_TAKE - 1:
                 time.sleep(PAUSE_BETWEEN_WINDOWS_SEC)
-        print(f"Saved {WINDOWS_PER_TAKE} windows for '{label}' (take_id={take_id}).")
+
+        print(
+            f"Saved {WINDOWS_PER_TAKE} windows for '{label}' "
+            f"(take_id {first_take_this_run}–{last_take_this_run})."
+        )
 
 
 if __name__ == "__main__":

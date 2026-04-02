@@ -1,0 +1,40 @@
+# imugesture-live.service — template for systemd on Raspberry Pi OS
+#
+# Edit paths below (REPO_ROOT, User, ExecStart Python) to match this machine, then install:
+#   sudo cp deploy/imugesture-live.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable imugesture-live.service
+#   sudo systemctl start imugesture-live.service
+#   sudo systemctl status imugesture-live.service
+#
+# Logs:
+#   journalctl -u imugesture-live.service -f
+#
+# If the service starts before Wi-Fi has an IP, enable a wait-online unit, e.g.:
+#   sudo systemctl enable NetworkManager-wait-online.service
+# (or systemd-networkd-wait-online.service if you use networkd)
+#
+# If I2C permission errors appear in logs but interactive shell works, ensure User is in
+# group `i2c` (`sudo usermod -aG i2c YOUR_USER` then re-login). SupplementaryGroups=i2c
+# below matches typical Pi I2C device access.
+
+[Unit]
+Description=IMU gesture live inference (run_live.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aaditey
+Group=aaditey
+WorkingDirectory=/home/aaditey/Desktop/imu-game-gesture-recgonition-1
+# Use the same interpreter you use manually (venv recommended if you use .venv).
+ExecStart=/usr/bin/python3 scripts/run_live.py
+# ExecStart=/home/aaditey/Desktop/imu-game-gesture-recgonition-1/.venv/bin/python scripts/run_live.py
+Environment=PYTHONUNBUFFERED=1
+SupplementaryGroups=i2c
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
