@@ -11,3 +11,4 @@ joblib
 adafruit-blinka
 adafruit-circuitpython-mpu6050
 adafruit-circuitpython-ads1x15
+openai>=1.0.0

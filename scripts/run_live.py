@@ -11,11 +11,13 @@ _repo_src = Path(__file__).resolve().parents[1] / "src"
 if _repo_src.is_dir():
     sys.path.insert(0, str(_repo_src))
 
+import argparse
 import json
 import os
+import queue
 import socket
+import threading
 import time
-import argparse
 
 from imugesture.paths import MODEL_JOBLIB
 
@@ -94,6 +96,95 @@ def parse_args():
         default=None,
         help="Override SAME_GESTURE_MIN_GAP_SEC.",
     )
+    p.add_argument(
+        "--enable-agent",
+        action="store_true",
+        help="Background LLM agent tunes min_confidence and motion energy thresholds from segment metrics.",
+    )
+    p.add_argument(
+        "--agent-interval",
+        type=float,
+        default=20.0,
+        help="Seconds between agent API calls when --enable-agent.",
+    )
+    p.add_argument(
+        "--agent-model",
+        type=str,
+        default="gpt-5.4",
+        help="Model for OpenAI Responses API (client.responses.create).",
+    )
+    p.add_argument(
+        "--openai-base-url",
+        type=str,
+        default=None,
+        help="e.g. http://localhost:11434/v1 for Ollama; default uses OPENAI_BASE_URL env or OpenAI cloud.",
+    )
+    p.add_argument(
+        "--agent-clamp-min",
+        type=float,
+        default=0.30,
+        help="Lower bound for agent-tuned min_confidence.",
+    )
+    p.add_argument(
+        "--agent-clamp-max",
+        type=float,
+        default=0.60,
+        help="Upper bound for agent-tuned min_confidence.",
+    )
+    p.add_argument(
+        "--agent-max-delta",
+        type=float,
+        default=0.03,
+        help="Max absolute change per agent tool call.",
+    )
+    p.add_argument(
+        "--agent-cooldown",
+        type=float,
+        default=15.0,
+        help="Min seconds between applied min_confidence changes.",
+    )
+    p.add_argument(
+        "--agent-energy-start-min",
+        type=float,
+        default=0.35,
+        help="Agent lower clamp for start_energy.",
+    )
+    p.add_argument(
+        "--agent-energy-start-max",
+        type=float,
+        default=0.95,
+        help="Agent upper clamp for start_energy.",
+    )
+    p.add_argument(
+        "--agent-energy-end-min",
+        type=float,
+        default=0.10,
+        help="Agent lower clamp for end_energy.",
+    )
+    p.add_argument(
+        "--agent-energy-end-max",
+        type=float,
+        default=0.55,
+        help="Agent upper clamp for end_energy.",
+    )
+    p.add_argument(
+        "--agent-energy-max-delta",
+        type=float,
+        default=0.06,
+        help="Max absolute change per set_start_energy / set_end_energy call.",
+    )
+    p.add_argument(
+        "--agent-energy-cooldown",
+        type=float,
+        default=15.0,
+        help="Min seconds between applied start_energy or end_energy changes.",
+    )
+    p.add_argument(
+        "--agent-energy-min-gap",
+        type=float,
+        default=0.05,
+        help="Required gap: start_energy - end_energy after agent updates.",
+    )
     return p.parse_args()
 
 
@@ -127,6 +218,7 @@ def main():
 
     args = parse_args()
     cfg = _live_config(args)
+    cfg_lock = threading.Lock()
 
     if not os.path.exists(MODEL_JOBLIB):
         print(
@@ -165,6 +257,11 @@ def main():
             f"intra_retrigger_sec={cfg['intra_retrigger_sec']}",
             f"same_gesture_gap_sec={cfg['same_gesture_gap_sec']}",
         )
+        if args.enable_agent:
+            print(
+                "Agent (dry-run): --enable-agent would use OPENAI_API_KEY, "
+                f"interval={args.agent_interval}s model={args.agent_model}"
+            )
         return
 
     try:
@@ -198,6 +295,46 @@ def main():
         f"min_segment_frames={cfg['min_segment_frames']}",
         f"same_gesture_gap_sec={cfg['same_gesture_gap_sec']}",
     )
+
+    stop_event = threading.Event()
+    metric_queue = None
+    agent_thread = None
+    if args.enable_agent:
+        from imugesture.tuning_agent import AgentSettings, enqueue_segment_metric, run_agent_loop
+
+        if not os.environ.get("OPENAI_API_KEY"):
+            print(
+                "Warning: OPENAI_API_KEY unset. Cloud APIs need it; "
+                "for Ollama set OPENAI_BASE_URL (e.g. http://localhost:11434/v1) and use a dummy key if required."
+            )
+        metric_queue = queue.Queue(maxsize=32)
+        agent_settings = AgentSettings(
+            interval_sec=args.agent_interval,
+            model=args.agent_model,
+            base_url=args.openai_base_url or os.environ.get("OPENAI_BASE_URL"),
+            api_key=os.environ.get("OPENAI_API_KEY", ""),
+            clamp_min=args.agent_clamp_min,
+            clamp_max=args.agent_clamp_max,
+            max_delta=args.agent_max_delta,
+            cooldown_sec=args.agent_cooldown,
+            energy_start_clamp_min=args.agent_energy_start_min,
+            energy_start_clamp_max=args.agent_energy_start_max,
+            energy_end_clamp_min=args.agent_energy_end_min,
+            energy_end_clamp_max=args.agent_energy_end_max,
+            energy_max_delta=args.agent_energy_max_delta,
+            energy_cooldown_sec=args.agent_energy_cooldown,
+            energy_min_gap=args.agent_energy_min_gap,
+        )
+        agent_thread = threading.Thread(
+            target=run_agent_loop,
+            args=(metric_queue, cfg, cfg_lock, stop_event, agent_settings),
+            daemon=True,
+            name="tuning_agent",
+        )
+        agent_thread.start()
+        print(
+            f"Tuning agent thread started (interval={args.agent_interval}s, model={args.agent_model})"
+        )
 
     def notify_action_pc(gesture_label: str, confidence: float) -> None:
         if action_sock is None or gesture_label not in TRIGGER_GESTURES:
@@ -234,6 +371,16 @@ def main():
     retrigger_label = None
     retrigger_pred_streak = 0
 
+    # Per-segment metrics for tuning agent (reset on segment start)
+    seg_max_energy = 0.0
+    seg_max_max_prob = 0.0
+    seg_frames_high_conf = 0
+    seg_best_label = None
+    seg_best_prob = 0.0
+    seg_fire_count = 0
+    seg_idle_high_conf_before_start = 0
+    accum_idle_high_conf = 0
+
     show_state(IDLE_LABEL)
 
     try:
@@ -250,6 +397,8 @@ def main():
                 window.pop(0)
 
             if len(window) == WINDOW_SIZE:
+                with cfg_lock:
+                    c = dict(cfg)
                 feats = window_to_features(window).reshape(1, -1)
                 pred_enc = model.predict(feats)[0]
                 label = label_encoder.inverse_transform([pred_enc])[0]
@@ -269,8 +418,18 @@ def main():
                     current_display = IDLE_LABEL
                     show_state(IDLE_LABEL)
 
+                # Idle-phase: trigger-class + above min_confidence while not in a segment and
+                # below segment-open energy (avoids counting the opening frame as idle).
+                if (
+                    not in_segment
+                    and motion_energy <= c["start_energy"]
+                ):
+                    cand_idle = display if display in TRIGGER_GESTURES else None
+                    if cand_idle is not None and max_prob >= c["min_confidence"]:
+                        accum_idle_high_conf += 1
+
                 # Motion-based segment start
-                if (not in_segment) and now >= cooldown_until and motion_energy > cfg["start_energy"]:
+                if (not in_segment) and now >= cooldown_until and motion_energy > c["start_energy"]:
                     in_segment = True
                     segment_fired = False
                     segment_label = None
@@ -282,16 +441,72 @@ def main():
                     last_fire_time = 0.0
                     retrigger_label = None
                     retrigger_pred_streak = 0
+                    seg_idle_high_conf_before_start = accum_idle_high_conf
+                    accum_idle_high_conf = 0
+                    seg_fire_count = 0
+                    seg_max_energy = float(motion_energy)
+                    seg_max_max_prob = float(max_prob)
+                    seg_frames_high_conf = 0
+                    seg_best_label = None
+                    seg_best_prob = 0.0
+                    if display in TRIGGER_GESTURES:
+                        seg_best_label = display
+                        seg_best_prob = max_prob
 
                 # Track quiet frames and end segment when motion settles
                 if in_segment:
+                    seg_max_energy = max(seg_max_energy, float(motion_energy))
+                    seg_max_max_prob = max(seg_max_max_prob, float(max_prob))
+                    candidate_roll = display if display in TRIGGER_GESTURES else None
+                    if candidate_roll is not None and max_prob > seg_best_prob:
+                        seg_best_label = candidate_roll
+                        seg_best_prob = float(max_prob)
+                    if (
+                        not segment_fired
+                        and candidate_roll is not None
+                        and max_prob >= c["min_confidence"]
+                    ):
+                        seg_frames_high_conf += 1
+
                     segment_age_frames += 1
-                    if motion_energy < cfg["end_energy"]:
+                    if motion_energy < c["end_energy"]:
                         quiet_frames += 1
                     else:
                         quiet_frames = 0
 
-                    if quiet_frames >= cfg["quiet_frames"]:
+                    if quiet_frames >= c["quiet_frames"]:
+                        if args.enable_agent and metric_queue is not None:
+                            record = {
+                                "t_mono": time.monotonic(),
+                                "segment_frames": segment_age_frames,
+                                "max_energy": seg_max_energy,
+                                "max_energy_above_start": float(
+                                    seg_max_energy - c["start_energy"]
+                                ),
+                                "fired": segment_fired,
+                                "fire_count": seg_fire_count,
+                                "max_max_prob": seg_max_max_prob,
+                                "max_prob_above_min": float(
+                                    seg_max_max_prob - c["min_confidence"]
+                                ),
+                                "best_non_idle": {
+                                    "label": seg_best_label,
+                                    "prob": seg_best_prob,
+                                },
+                                "frames_high_conf_non_idle": seg_frames_high_conf,
+                                "idle_high_conf_frames_before_segment": (
+                                    seg_idle_high_conf_before_start
+                                ),
+                                "thresholds_at_segment_end": {
+                                    "start_energy": float(c["start_energy"]),
+                                    "end_energy": float(c["end_energy"]),
+                                    "min_confidence": float(c["min_confidence"]),
+                                    "quiet_frames": int(c["quiet_frames"]),
+                                    "stable_frames": int(c["stable_frames"]),
+                                    "min_segment_frames": int(c["min_segment_frames"]),
+                                },
+                            }
+                            enqueue_segment_metric(metric_queue, record)
                         in_segment = False
                         segment_fired = False
                         segment_label = None
@@ -301,10 +516,10 @@ def main():
                 # First gesture detection within an active segment
                 # Wait a few frames after segment start so we latch on the
                 # main pose/motion, not the initial transition.
-                if in_segment and not segment_fired and segment_age_frames >= cfg["min_segment_frames"]:
+                if in_segment and not segment_fired and segment_age_frames >= c["min_segment_frames"]:
                     candidate = display if display in TRIGGER_GESTURES else None
 
-                    if candidate and max_prob >= cfg["min_confidence"]:
+                    if candidate and max_prob >= c["min_confidence"]:
                         if candidate == segment_label:
                             segment_pred_streak += 1
                         else:
@@ -314,14 +529,15 @@ def main():
                         segment_label = None
                         segment_pred_streak = 0
 
-                    if segment_label and segment_pred_streak >= cfg["stable_frames"]:
+                    if segment_label and segment_pred_streak >= c["stable_frames"]:
                         gesture = segment_label
                         print(gesture)
                         notify_action_pc(gesture, max_prob)
+                        seg_fire_count += 1
                         show_state(gesture)
                         current_display = gesture
                         pulse_until = now + PULSE_SEC
-                        cooldown_until = now + cfg["cooldown_sec"]
+                        cooldown_until = now + c["cooldown_sec"]
                         segment_fired = True
                         last_fired_label = gesture
                         last_fire_time = now
@@ -336,9 +552,9 @@ def main():
                     can_consider_new = (
                         candidate2 is not None
                         and candidate2 != last_fired_label
-                        and max_prob >= MIN_CONFIDENCE
+                        and max_prob >= c["min_confidence"]
                         and now >= cooldown_until
-                        and (now - last_fire_time) >= INTRA_SEGMENT_RETRIGGER_SEC
+                        and (now - last_fire_time) >= c["intra_retrigger_sec"]
                     )
 
                     if can_consider_new:
@@ -351,14 +567,15 @@ def main():
                         retrigger_label = None
                         retrigger_pred_streak = 0
 
-                    if retrigger_label and retrigger_pred_streak >= cfg["stable_frames"]:
+                    if retrigger_label and retrigger_pred_streak >= c["stable_frames"]:
                         gesture = retrigger_label
                         print(gesture)
                         notify_action_pc(gesture, max_prob)
+                        seg_fire_count += 1
                         show_state(gesture)
                         current_display = gesture
                         pulse_until = now + PULSE_SEC
-                        cooldown_until = now + cfg["cooldown_sec"]
+                        cooldown_until = now + c["cooldown_sec"]
                         last_fired_label = gesture
                         last_fire_time = now
                         retrigger_label = None
@@ -367,6 +584,10 @@ def main():
             time.sleep(SAMPLE_DELAY_SEC)
     except KeyboardInterrupt:
         pass
+    finally:
+        if args.enable_agent and agent_thread is not None:
+            stop_event.set()
+            agent_thread.join(timeout=5.0)
 
 
 if __name__ == "__main__":
